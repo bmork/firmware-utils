@@ -19,7 +19,7 @@
  * UDP to multicast destination address 225.0.0.0 port 5631. Source
  * address and port is arbitrary.
  *
- *  Payload is split in packets prepended with a 30 byte header:
+ *  Payload is split in packets prepended with a 30 or 32 byte header:
  *
  *   4 byte signature: 'z', 'y', 'x', 0x0 [1]
  *   16 bit checksum [2][3]
@@ -29,7 +29,7 @@
  *   32 bit image bitmap [2][7]
  *   2 byte ascii country code [8]
  *   8 bit  flags [9]
- *   5 byte reserved [10]
+ *   5 or 7 byte reserved [10]
  *
  * [1] the terminating null is not actually checked by the observed
  *     implementations, but is assumed to be safest in case the
@@ -92,7 +92,11 @@
  *      they are interpreted by other devices, resulting in
  *      unexpected and potentially harmful behaviour.
  *
- * Copyright (C) 2024 Bjørn Mork <bjorn@mork.no>
+ *      Newer devices have a 32 bytes header with 7 reserved bytes
+ *      instead of the original 30 bytes header with 5 reserved bytes.
+ *
+ *
+ * Copyright (C) 2024 - 2025 Bjørn Mork <bjorn@mork.no>
  */
 
 #include <arpa/inet.h>
@@ -111,10 +115,11 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
-/* defaulting to 10 ms interpacket delay */
-static int pktdelay = 10000;
+/* defaulting to 0.1 ms interpacket delay */
+static int pktdelay = 100;
 static int sockfd = -1;
 static bool exiting;
+static int classid;
 
 /* All integers are stored in network order (big endian) */
 struct zycast_t {
@@ -128,10 +133,8 @@ struct zycast_t {
 	unsigned char images;
 	char cc[2];
 	unsigned char flags;
-	char reserved[5];
 } __attribute__ ((packed));
 
-#define HDRSIZE (sizeof(struct zycast_t))
 #define DEST_ADDR "225.0.0.0"
 #define DEST_PORT 5631
 #define CHUNK 1024
@@ -151,6 +154,25 @@ enum imagetype {
 #define FLAG_SET_DEBUG  BIT(0)
 #define FLAG_ERASE_ROM  BIT(1)
 #define FLAG_ERASE_ROMD BIT(2)
+
+enum protoclasses {
+	NR7101 = 0,
+	EE4600,
+	_MAX_CLASSES
+};
+
+/* CHUNK sized frames are required regardless of actual datalen */
+#define	FEAT_FILLFRAME BIT(0)
+
+struct protoclass_t {
+	const char name[10];
+	size_t hdrsize;
+	uint32_t imagesupport;
+	uint32_t features;
+} protoclass[] = {
+	[ NR7101 ] = { "NR7101", 30, BIT(BOOTBASE) | BIT(ROM) | BIT(RAS) | BIT(ROMD) | BIT(BACKUP), 0 },
+	[ EE4600 ] = { "EE4600", 32, BIT(RAS) | BIT(BACKUP), FEAT_FILLFRAME },
+};
 
 static void errexit(const char *msg)
 {
@@ -190,22 +212,35 @@ static uint16_t chksum(uint8_t *p, size_t len)
 	return (uint16_t)((sum >> 16) + sum);
 }
 
-static int pushimage(void *file, struct zycast_t *phdr)
+static int pushimage(void *file, size_t len, enum imagetype type, void *buf)
 {
+	struct zycast_t *phdr = buf;
 	uint32_t count = 0;
-	uint32_t len = ntohl(phdr->flen);
 	uint32_t plen = CHUNK;
+	size_t framelen = protoclass[classid].hdrsize + CHUNK;
 
-	while (!exiting && len > 0) {
-		if (len < CHUNK)
+	/* constants per file */
+	phdr->flen = htonl(len);
+	phdr->type = BIT(type);
+	phdr->plen = htonl(CHUNK);
+
+	while (!exiting && (len > 0 || !count)) { /* !count to support zero length files */
+		if (len < CHUNK) {
 			plen = len;
-		phdr->plen = htonl(plen);
+			phdr->plen = htonl(len);
+
+			/* backwards compatibility. is this required? */
+			if (classid == NR7101)
+				framelen = protoclass[classid].hdrsize + plen;
+			else
+				memset(buf + protoclass[classid].hdrsize, 0, CHUNK);
+		}
 		phdr->pid = htonl(count++);
 		phdr->chksum = htons(chksum(file, plen));
-		if (send(sockfd, phdr, HDRSIZE, MSG_MORE | MSG_DONTROUTE) < 0)
-			errexit("send(phdr)");
-		if (send(sockfd, file, plen, MSG_DONTROUTE) < 0)
-			errexit("send(payload)");
+		if (plen)
+			memcpy(buf + protoclass[classid].hdrsize, file, plen);
+		if (send(sockfd, phdr, framelen , MSG_DONTROUTE) < 0)
+			errexit("send()");
 		file += plen;
 		len -= plen;
 
@@ -223,13 +258,28 @@ static void sig_handler(int signo)
 		exiting = true;
 }
 
+static const char *class_descr(enum protoclasses class)
+{
+	switch (class) {
+	case NR7101:
+		return "Mediatek MT7621 based MIPS";
+	case EE4600:
+		return "Mediatek MT7988 based arm64";
+	default:
+	}
+	return "";
+}
+
 static void usage(const char *name)
 {
+	int i;
+
 	fprintf(stderr, "Usage:\n");
 	fprintf(stderr, " %s [options]\n", name);
 	fprintf(stderr, "Options:\n");
+	fprintf(stderr, "\t-c class                protocol variant defining device class\n");
 	fprintf(stderr, "\t-i interface            outgoing interface for multicast packets\n");
-	fprintf(stderr, "\t-t delay                interpacket delay in milliseconds\n");
+	fprintf(stderr, "\t-t delay                interpacket delay in microseconds\n");
 	fprintf(stderr, "\t-f rasimage             primary firmware image\n");
 	fprintf(stderr, "\t-b backupimage          secondary firmware image (if supported)\n");
 	fprintf(stderr, "\t-d rom                  data for the \"rom\" or \"data\" partition\n");
@@ -238,18 +288,57 @@ static void usage(const char *name)
 	fprintf(stderr, "\t-u bootloader           flash new bootloader\n");
 	fprintf(stderr, "\nWARNING: bootloader upgrades are dangerous.  DON'T DO IT!\n");
 #endif
-	fprintf(stderr, "\nNOTE: some bootloaders will flash a rasimage to both primary and\n");
+	fprintf(stderr, "\n\"rasimage\" is the only image type which is supported by all devices\n");
+	fprintf(stderr, "\nNOTE: some bootloaders will flash a \"rasimage\" to both primary and\n");
 	fprintf(stderr, "secondary firmware partitions\n");
+	fprintf(stderr, "\nCLASS: Different device generations use slightly different protocols\n");
+	fprintf(stderr, "The list of supported devices for each variant is unknown.  These device\n");
+	fprintf(stderr, "names are only used to identifiers for a specific variant.  The class is\n");
+	fprintf(stderr, "not expected to match the target device by name, only by platform/generation\n");
+	fprintf(stderr, "\nSelecting the wrong class is harmless. The target device will reject the\n");
+	fprintf(stderr, "packets due to wrong size and header size.\n");
+	fprintf(stderr, "\nThe known classes and their describing attributes are:\n");
+	for (i = 0; i < _MAX_CLASSES; i++) {
+		fprintf(stderr, "\n%s: %s\n\t%s.\n\t%zu bytes header.\n%s",
+			protoclass[i].name,
+			i == 0 ? "(default) " : "",
+			class_descr(i),
+			protoclass[i].hdrsize,
+			protoclass[i].features && FEAT_FILLFRAME ? "\tConstant frame size.\n" : ""
+			);
+	}
 	fprintf(stderr, "\nExample:\n");
-	fprintf(stderr, " %s -i eth1 -t 20 -f openwrt-initramfs.bin\n\n", name);
+	fprintf(stderr, " %s -c NR7101 -i eth1 -f openwrt-initramfs.bin\n\n", name);
 	if (sockfd >= 0)
 		close(sockfd);
 	exit(EXIT_FAILURE);
 }
 
+static void *bufalloc(unsigned char images)
+{
+	void *buf = malloc(protoclass[classid].hdrsize + CHUNK);
+	struct zycast_t *hdr = buf;
+
+	if (!buf)
+		errexit("malloc()");
+
+	memset(buf, 0, protoclass[classid].hdrsize + CHUNK);
+	hdr->magic = htonl(MAGIC);
+	hdr->flags = FLAG_SET_DEBUG;
+	hdr->images = images;
+
+	/* is this required? kept for backward compatibility */
+	if (classid == NR7101) {
+		hdr->cc[0] = 'F';
+		hdr->cc[1] = 'F';
+	}
+
+	return buf;
+}
+
 #define ADD_IMAGE(nr) \
 	do { \
-		hdr.images |= BIT(nr); \
+		images |= BIT(nr); \
 		file[nr] = map_input(optarg, &len[nr]); \
 		if (!file[nr]) \
 			errexit(optarg); \
@@ -257,18 +346,16 @@ static void usage(const char *name)
 
 int main(int argc, char **argv)
 {
+
 	void *file[_MAX_IMAGETYPE] = {};
 	size_t len[_MAX_IMAGETYPE] = {};
-	struct zycast_t hdr = {
-		.magic = htonl(MAGIC),
-		.cc    = {'F', 'F' },
-		.flags = FLAG_SET_DEBUG,
-	};
 	const struct sockaddr_in dest = {
 		.sin_family = AF_INET,
 		.sin_addr.s_addr = inet_addr(DEST_ADDR),
 		.sin_port = htons(DEST_PORT),
 	};
+	unsigned char images;
+	void *pktbuf;
 	int i, c;
 
 	if (signal(SIGINT, sig_handler) == SIG_ERR)
@@ -279,8 +366,16 @@ int main(int argc, char **argv)
 	if (connect(sockfd, (struct sockaddr *)&dest, sizeof(dest)) < 0)
 		errexit("connect()");
 
-	while ((c = getopt(argc, argv, "i:t:f:b:d:r:u:")) != -1) {
+	while ((c = getopt(argc, argv, "c:i:t:f:b:d:r:u:")) != -1) {
 		switch (c) {
+		case 'c':
+			classid = -1;
+			for (i = 0; i < _MAX_CLASSES; i++)
+				if (!strcmp(optarg, protoclass[i].name))
+					classid = i;
+			if (classid < 0)
+				usage(argv[0]);
+			break;
 		case 'i':
 			if (setsockopt(sockfd, SOL_SOCKET, SO_BINDTODEVICE,  optarg, strlen(optarg)) < 0)
 				errexit(optarg);
@@ -288,8 +383,8 @@ int main(int argc, char **argv)
 		case 't':
 			i = strtoul(optarg, NULL, 0);
 			if (i < 1)
-				i = 1;
-			pktdelay = i * 1000;
+				i = 10000;
+			pktdelay = i;
 			break;
 		case 'f':
 			ADD_IMAGE(RAS);
@@ -313,17 +408,21 @@ int main(int argc, char **argv)
 		}
 	}
 
-	if (!hdr.images)
+	/* simply bail out if the user tries to do anything yet unsupported */
+	if ((images & protoclass[classid].imagesupport) != images)
+		errexit("unsupported images for this class");
+	images &= protoclass[classid].imagesupport;
+	if (!images)
 		usage(argv[0]);
+
+	/* allocate a frame buffer */
+	pktbuf = bufalloc(images);
 
 	fprintf(stderr, "Press Ctrl+C to stop before rebooting target after upgrade\n");
 	while (!exiting) {
 		for (i = 0; i < _MAX_IMAGETYPE; i++) {
-			if (hdr.images & BIT(i)) {
-				hdr.type = BIT(i);
-				hdr.flen = htonl(len[i]);
-				pushimage(file[i], &hdr);
-			}
+			if (images & BIT(i))
+				pushimage(file[i], len[i], i, pktbuf);
 		}
 	};
 
@@ -331,8 +430,9 @@ int main(int argc, char **argv)
 	if (sockfd >= 0)
 		close(sockfd);
 	for (i = 0; i < _MAX_IMAGETYPE; i++)
-		if (hdr.images & BIT(i))
+		if (images & BIT(i))
 			munmap(file[i], len[i]);
 
+	free(pktbuf);
 	return EXIT_SUCCESS;
 }
