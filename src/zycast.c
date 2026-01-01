@@ -96,7 +96,7 @@
  *      instead of the original 30 bytes header with 5 reserved bytes.
  *
  *
- * Copyright (C) 2024 - 2025 Bjørn Mork <bjorn@mork.no>
+ * Copyright (C) 2024, 2026 Bjørn Mork <bjorn@mork.no>
  */
 
 #include <arpa/inet.h>
@@ -119,7 +119,7 @@
 static int pktdelay = 100;
 static int sockfd = -1;
 static bool exiting;
-static int classid;
+static int protorev;
 
 /* All integers are stored in network order (big endian) */
 struct zycast_t {
@@ -155,24 +155,19 @@ enum imagetype {
 #define FLAG_ERASE_ROM  BIT(1)
 #define FLAG_ERASE_ROMD BIT(2)
 
-enum protoclasses {
-	NR7101 = 0,
-	EE4600,
-	_MAX_CLASSES
-};
-
-/* CHUNK sized frames are required regardless of actual datalen */
+/* must send CHUNK sized frames required regardless of actual datalen */
 #define	FEAT_FILLFRAME BIT(0)
 
-struct protoclass_t {
-	const char name[10];
+/* known protocol revisions */
+struct revision_t {
 	size_t hdrsize;
 	uint32_t imagesupport;
 	uint32_t features;
-} protoclass[] = {
-	[ NR7101 ] = { "NR7101", 30, BIT(BOOTBASE) | BIT(ROM) | BIT(RAS) | BIT(ROMD) | BIT(BACKUP), 0 },
-	[ EE4600 ] = { "EE4600", 32, BIT(RAS) | BIT(BACKUP), FEAT_FILLFRAME },
+} revision[] = {
+	[ 0 ] = { 30, BIT(BOOTBASE) | BIT(ROM) | BIT(RAS) | BIT(ROMD) | BIT(BACKUP), 0 },
+	[ 1 ] = { 32, BIT(RAS) | BIT(ROMD), FEAT_FILLFRAME },
 };
+#define NUMREVISIONS (sizeof(revision) / sizeof(revision[0]))
 
 static void errexit(const char *msg)
 {
@@ -217,7 +212,7 @@ static int pushimage(void *file, size_t len, enum imagetype type, void *buf)
 	struct zycast_t *phdr = buf;
 	uint32_t count = 0;
 	uint32_t plen = CHUNK;
-	size_t framelen = protoclass[classid].hdrsize + CHUNK;
+	size_t framelen = revision[protorev].hdrsize + CHUNK;
 
 	/* constants per file */
 	phdr->flen = htonl(len);
@@ -230,15 +225,15 @@ static int pushimage(void *file, size_t len, enum imagetype type, void *buf)
 			phdr->plen = htonl(len);
 
 			/* backwards compatibility. is this required? */
-			if (classid == NR7101)
-				framelen = protoclass[classid].hdrsize + plen;
+			if (protorev == 0)
+				framelen = revision[protorev].hdrsize + plen;
 			else
-				memset(buf + protoclass[classid].hdrsize, 0, CHUNK);
+				memset(buf + revision[protorev].hdrsize, 0, CHUNK);
 		}
 		phdr->pid = htonl(count++);
 		phdr->chksum = htons(chksum(file, plen));
 		if (plen)
-			memcpy(buf + protoclass[classid].hdrsize, file, plen);
+			memcpy(buf + revision[protorev].hdrsize, file, plen);
 		if (send(sockfd, phdr, framelen , MSG_DONTROUTE) < 0)
 			errexit("send()");
 		file += plen;
@@ -258,18 +253,6 @@ static void sig_handler(int signo)
 		exiting = true;
 }
 
-static const char *class_descr(enum protoclasses class)
-{
-	switch (class) {
-	case NR7101:
-		return "Mediatek MT7621 based MIPS";
-	case EE4600:
-		return "Mediatek MT7988 based arm64";
-	default:
-	}
-	return "";
-}
-
 static void usage(const char *name)
 {
 	int i;
@@ -277,13 +260,14 @@ static void usage(const char *name)
 	fprintf(stderr, "Usage:\n");
 	fprintf(stderr, " %s [options]\n", name);
 	fprintf(stderr, "Options:\n");
-	fprintf(stderr, "\t-c class                protocol variant defining device class\n");
+	fprintf(stderr, "\t-v revision             protocol revision\n");
 	fprintf(stderr, "\t-i interface            outgoing interface for multicast packets\n");
-	fprintf(stderr, "\t-t delay                interpacket delay in microseconds\n");
+	fprintf(stderr, "\t-t microseconds         interpacket delay (default: %u)\n", pktdelay);
 	fprintf(stderr, "\t-f rasimage             primary firmware image\n");
 	fprintf(stderr, "\t-b backupimage          secondary firmware image (if supported)\n");
 	fprintf(stderr, "\t-d rom                  data for the \"rom\" or \"data\" partition\n");
 	fprintf(stderr, "\t-r romd                 data for the \"rom-d\" partition\n");
+	fprintf(stderr, "\t-e                      set EngDebugFlag only (implies protocol revision 1)\n");
 #ifdef DO_BOOTBASE
 	fprintf(stderr, "\t-u bootloader           flash new bootloader\n");
 	fprintf(stderr, "\nWARNING: bootloader upgrades are dangerous.  DON'T DO IT!\n");
@@ -291,24 +275,21 @@ static void usage(const char *name)
 	fprintf(stderr, "\n\"rasimage\" is the only image type which is supported by all devices\n");
 	fprintf(stderr, "\nNOTE: some bootloaders will flash a \"rasimage\" to both primary and\n");
 	fprintf(stderr, "secondary firmware partitions\n");
-	fprintf(stderr, "\nCLASS: Different device generations use slightly different protocols\n");
-	fprintf(stderr, "The list of supported devices for each variant is unknown.  These device\n");
-	fprintf(stderr, "names are only used to identifiers for a specific variant.  The class is\n");
-	fprintf(stderr, "not expected to match the target device by name, only by platform/generation\n");
-	fprintf(stderr, "\nSelecting the wrong class is harmless. The target device will reject the\n");
-	fprintf(stderr, "packets due to wrong size and header size.\n");
-	fprintf(stderr, "\nThe known classes and their describing attributes are:\n");
-	for (i = 0; i < _MAX_CLASSES; i++) {
-		fprintf(stderr, "\n%s: %s\n\t%s.\n\t%zu bytes header.\n%s",
-			protoclass[i].name,
-			i == 0 ? "(default) " : "",
-			class_descr(i),
-			protoclass[i].hdrsize,
-			protoclass[i].features && FEAT_FILLFRAME ? "\tConstant frame size.\n" : ""
-			);
+	fprintf(stderr, "\nREVISION: Different device generations use slightly different protocols.\n");
+	fprintf(stderr, "The revision numbers used here are arbitrary and unofficial. And the list of\n");
+	fprintf(stderr, "supported devices for each revision is unknown. Using the wrong revision is\n");
+	fprintf(stderr, "harmless. Unrecognized packets will be silently ignored by the target device.\n");
+	fprintf(stderr, "\nCurrently known revision numbers and their describing attributes:\n");
+	for (i = 0; i < NUMREVISIONS; i++) {
+		fprintf(stderr, "\t%u\n", i);
+		fprintf(stderr, "\t\t%zu bytes header\n", revision[i].hdrsize);
+		if (i == 0)
+			fprintf(stderr, "\t\tdefault\n");
+		if (revision[i].features && FEAT_FILLFRAME)
+			fprintf(stderr, "\t\tconstant frame size\n");
 	}
 	fprintf(stderr, "\nExample:\n");
-	fprintf(stderr, " %s -c NR7101 -i eth1 -f openwrt-initramfs.bin\n\n", name);
+	fprintf(stderr, " %s -v 1 -i eth1 -f openwrt-initramfs.bin\n\n", name);
 	if (sockfd >= 0)
 		close(sockfd);
 	exit(EXIT_FAILURE);
@@ -316,19 +297,19 @@ static void usage(const char *name)
 
 static void *bufalloc(unsigned char images)
 {
-	void *buf = malloc(protoclass[classid].hdrsize + CHUNK);
+	void *buf = malloc(revision[protorev].hdrsize + CHUNK);
 	struct zycast_t *hdr = buf;
 
 	if (!buf)
 		errexit("malloc()");
 
-	memset(buf, 0, protoclass[classid].hdrsize + CHUNK);
+	memset(buf, 0, revision[protorev].hdrsize + CHUNK);
 	hdr->magic = htonl(MAGIC);
 	hdr->flags = FLAG_SET_DEBUG;
 	hdr->images = images;
 
 	/* is this required? kept for backward compatibility */
-	if (classid == NR7101) {
+	if (protorev == 0) {
 		hdr->cc[0] = 'F';
 		hdr->cc[1] = 'F';
 	}
@@ -366,15 +347,17 @@ int main(int argc, char **argv)
 	if (connect(sockfd, (struct sockaddr *)&dest, sizeof(dest)) < 0)
 		errexit("connect()");
 
-	while ((c = getopt(argc, argv, "c:i:t:f:b:d:r:u:")) != -1) {
+	while ((c = getopt(argc, argv, "v:ei:t:f:b:d:r:u:")) != -1) {
 		switch (c) {
-		case 'c':
-			classid = -1;
-			for (i = 0; i < _MAX_CLASSES; i++)
-				if (!strcmp(optarg, protoclass[i].name))
-					classid = i;
-			if (classid < 0)
+		case 'v':
+			protorev = atoi(optarg);
+			if (protorev >= NUMREVISIONS)
 				usage(argv[0]);
+			break;
+		case 'e':
+			/* an empty rom-d image sets EngDebugFlag without flashing */
+			protorev = 1;
+			images = BIT(ROMD);
 			break;
 		case 'i':
 			if (setsockopt(sockfd, SOL_SOCKET, SO_BINDTODEVICE,  optarg, strlen(optarg)) < 0)
@@ -409,9 +392,9 @@ int main(int argc, char **argv)
 	}
 
 	/* simply bail out if the user tries to do anything yet unsupported */
-	if ((images & protoclass[classid].imagesupport) != images)
+	if ((images & revision[protorev].imagesupport) != images)
 		errexit("unsupported images for this class");
-	images &= protoclass[classid].imagesupport;
+	images &= revision[protorev].imagesupport;
 	if (!images)
 		usage(argv[0]);
 
@@ -424,13 +407,14 @@ int main(int argc, char **argv)
 			if (images & BIT(i))
 				pushimage(file[i], len[i], i, pktbuf);
 		}
+		usleep(100 * pktdelay); /* wait a bit before repeating */
 	};
 
 	fprintf(stderr, "\nClosing all files\n");
 	if (sockfd >= 0)
 		close(sockfd);
 	for (i = 0; i < _MAX_IMAGETYPE; i++)
-		if (images & BIT(i))
+		if (images & BIT(i) && len[i])
 			munmap(file[i], len[i]);
 
 	free(pktbuf);
