@@ -209,6 +209,11 @@ static uint16_t chksum(uint8_t *p, size_t len)
 
 static int pushimage(void *file, size_t len, enum imagetype type, void *buf)
 {
+	const struct sockaddr_in dest = {
+		.sin_family = AF_INET,
+		.sin_addr.s_addr = inet_addr(DEST_ADDR),
+		.sin_port = htons(DEST_PORT),
+	};
 	struct zycast_t *phdr = buf;
 	uint32_t count = 0;
 	uint32_t plen = CHUNK;
@@ -234,8 +239,8 @@ static int pushimage(void *file, size_t len, enum imagetype type, void *buf)
 		phdr->chksum = htons(chksum(file, plen));
 		if (plen)
 			memcpy(buf + revision[protorev].hdrsize, file, plen);
-		if (send(sockfd, phdr, framelen , MSG_DONTROUTE) < 0)
-			errexit("send()");
+		if (sendto(sockfd, phdr, framelen , MSG_DONTROUTE, (struct sockaddr *)&dest, sizeof(dest)) < 0)
+			errexit("sendto()");
 		file += plen;
 		len -= plen;
 
@@ -330,11 +335,6 @@ int main(int argc, char **argv)
 
 	void *file[_MAX_IMAGETYPE] = {};
 	size_t len[_MAX_IMAGETYPE] = {};
-	const struct sockaddr_in dest = {
-		.sin_family = AF_INET,
-		.sin_addr.s_addr = inet_addr(DEST_ADDR),
-		.sin_port = htons(DEST_PORT),
-	};
 	unsigned char images;
 	void *pktbuf;
 	int i, c;
@@ -344,8 +344,6 @@ int main(int argc, char **argv)
 	sockfd = socket(AF_INET, SOCK_DGRAM, 0);
 	if (sockfd < 0)
 		errexit("socket()");
-	if (connect(sockfd, (struct sockaddr *)&dest, sizeof(dest)) < 0)
-		errexit("connect()");
 
 	while ((c = getopt(argc, argv, "v:ei:t:f:b:d:r:u:")) != -1) {
 		switch (c) {
