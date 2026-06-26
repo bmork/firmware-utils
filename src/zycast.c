@@ -148,6 +148,8 @@ enum imagetype {
 	RAS,
 	ROMD,
 	BACKUP,
+	XX,
+	ROMD1,
 	_MAX_IMAGETYPE
 };
 
@@ -165,7 +167,7 @@ struct revision_t {
 	uint32_t features;
 } revision[] = {
 	[ 0 ] = { 30, BIT(BOOTBASE) | BIT(ROM) | BIT(RAS) | BIT(ROMD) | BIT(BACKUP), 0 },
-	[ 1 ] = { 32, BIT(RAS) | BIT(ROMD), FEAT_FILLFRAME },
+	[ 1 ] = { 32, BIT(RAS) | BIT(ROM) | BIT(ROMD) | BIT(ROMD1), FEAT_FILLFRAME },
 };
 #define NUMREVISIONS (sizeof(revision) / sizeof(revision[0]))
 
@@ -223,6 +225,8 @@ static int pushimage(void *file, size_t len, enum imagetype type, void *buf)
 	phdr->flen = htonl(len);
 	phdr->type = BIT(type);
 	phdr->plen = htonl(CHUNK);
+	if (type == ROMD1)
+		phdr->type += BIT(7);
 
 	while (!exiting && (len > 0 || !count)) { /* !count to support zero length files */
 		if (len < CHUNK) {
@@ -345,7 +349,7 @@ int main(int argc, char **argv)
 	if (sockfd < 0)
 		errexit("socket()");
 
-	while ((c = getopt(argc, argv, "v:ei:t:f:b:d:r:u:")) != -1) {
+	while ((c = getopt(argc, argv, "v:ei:t:f:b:d:r:x:u:")) != -1) {
 		switch (c) {
 		case 'v':
 			protorev = atoi(optarg);
@@ -378,6 +382,9 @@ int main(int argc, char **argv)
 			break;
 		case 'r':
 			ADD_IMAGE(ROMD);
+			break;
+		case 'x':
+			ADD_IMAGE(ROMD1);
 			break;
 		case 'u':
 #ifdef DO_BOOTBASE
